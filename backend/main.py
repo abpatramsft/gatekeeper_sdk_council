@@ -3,15 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import re
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+# Load .env from the project root (works both locally and inside Docker)
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path)
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from github_client import GitHubClient
-from copilot_fetcher import fetch_copilot_sessions
+try:
+    from github_client import GitHubClient
+    from copilot_fetcher import fetch_copilot_sessions
+except ImportError:
+    from backend.github_client import GitHubClient
+    from backend.copilot_fetcher import fetch_copilot_sessions
 
 app = FastAPI(title="Gatekeeper Viewer API", version="1.0.0")
 
@@ -204,6 +221,11 @@ class SessionFetchRequest(BaseModel):
     fetch_all: bool = False
 
 
+class SessionUploadRequest(BaseModel):
+    sessions: list[dict]
+    session_data: dict[str, Any]
+
+
 @app.post("/api/sessions/fetch")
 async def fetch_sessions_endpoint(body: SessionFetchRequest) -> dict:
     """Fetch Copilot sessions using the supplied PAT — purely in-memory, no disk I/O."""
@@ -224,6 +246,27 @@ async def fetch_sessions_endpoint(body: SessionFetchRequest) -> dict:
     return {
         "count": len(sessions),
         "message": f"Fetched {len(sessions)} session(s) successfully",
+    }
+
+
+@app.post("/api/sessions/upload")
+async def upload_sessions(body: SessionUploadRequest) -> dict:
+    """Import sessions from an uploaded folder payload.
+
+    Expects:
+      - body.sessions: list of session metadata (contents of sessions.json)
+      - body.session_data: mapping of sessionId -> full session JSON
+    """
+    if not body.sessions:
+        raise HTTPException(status_code=400, detail="No session metadata provided")
+
+    _session_store["sessions"] = body.sessions
+    _session_store["session_data"] = body.session_data
+
+    return {
+        "count": len(body.sessions),
+        "details_count": len(body.session_data),
+        "message": f"Imported {len(body.sessions)} session(s) with {len(body.session_data)} detail file(s)",
     }
 
 
@@ -255,12 +298,33 @@ class AgentQueryRequest(BaseModel):
 
 def _call_agent_sync(context: str, query: str) -> str:
     """Synchronous call to the Azure AI agent (runs in thread pool)."""
-    from azure.identity import DefaultAzureCredential
+    from azure.identity import DefaultAzureCredential, ClientSecretCredential
     from azure.ai.projects import AIProjectClient
+
+    # Use service principal if env vars are set (Docker / CI), else fall back
+    # to DefaultAzureCredential (works with `az login` locally).
+    tenant = os.environ.get("AZURE_TENANT_ID")
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    client_secret = os.environ.get("AZURE_CLIENT_SECRET")
+
+    if tenant and client_id and client_secret:
+        logger.info("Using ClientSecretCredential (service principal) for Azure auth")
+        credential = ClientSecretCredential(
+            tenant_id=tenant,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    else:
+        logger.warning(
+            "AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET not all set — "
+            "falling back to DefaultAzureCredential. "
+            "Pass --env-file .env to docker run, or set the vars in your container environment."
+        )
+        credential = DefaultAzureCredential()
 
     project_client = AIProjectClient(
         endpoint=AGENT_ENDPOINT,
-        credential=DefaultAzureCredential(),
+        credential=credential,
     )
 
     agent = project_client.agents.get(agent_name=AGENT_NAME)
@@ -296,3 +360,20 @@ async def agent_query(body: AgentQueryRequest) -> dict:
         return {"response": result}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent call failed: {exc}")
+
+
+# ── Serve built frontend (production / Docker) ──────────────
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+if _STATIC_DIR.is_dir():
+    # Serve JS/CSS/assets at /assets
+    app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Catch-all: serve index.html for client-side routing."""
+        file = _STATIC_DIR / full_path
+        if file.is_file():
+            return FileResponse(file)
+        return FileResponse(_STATIC_DIR / "index.html")
