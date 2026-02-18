@@ -125,3 +125,12 @@ The [Dockerfile](Dockerfile) uses a **multi-stage build**:
 2. **Stage 2** (`python:3.12-slim`) — Installs Node.js 20 (for `@github/copilot` CLI), Python dependencies, copies backend source, and serves the built frontend as static files through FastAPI.
 
 The final image serves everything on **port 8000** with no external web server required.
+
+
+## Required additional package installation
+
+This application fetches and visualises the gatekeeper runs in your project. It uses these following runs:
+- Feature requirement Analysis workflow run (pre dev)
+- Gatekeeper Analysis workflow run (post dev)
+
+For your existing project on your local simply install [gatekeeper-dev-kit](https://github.com/abpatramsft/gatekeeper_dev_kit) and initialise your project with gatekeeper-dev-kit that adds the required packages to your project codebase.
