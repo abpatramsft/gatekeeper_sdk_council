@@ -1,0 +1,496 @@
+name: Gatekeeper Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      frd_query:
+        description: 'Feature Requirement Document (FRD) text describing expected features'
+        required: true
+        type: string
+      issue_number:
+        description: 'GitHub issue number to include as additional context (optional)'
+        required: false
+        type: string
+
+# ──────────────────────────────────────────────────────────
+# Pipeline:
+#   Step 1  (requirement-drift)      — Analyse FRD vs implemented features
+#   Step 2  (technical-excellence)   — Code quality & architecture review
+#   Step 3  (unit-test-coverage)     — Test coverage analysis
+#   Steps 1-3 run in PARALLEL
+#   Step 4  (production-readiness)   — Consumes chairman outputs from 1-3,
+#                                      renders GO / NO-GO verdict
+#   Final   (final-report)           — Bundles every artifact into one download
+# ──────────────────────────────────────────────────────────
+
+jobs:
+  # ════════════════════════════════════════════════════════
+  # STEP 0 — Prepare Combined FRD Context
+  #          Fetches issue details (if provided) and merges with FRD text
+  # ════════════════════════════════════════════════════════
+  prepare-context:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+    outputs:
+      combined_frd: ${{ steps.combine.outputs.combined_frd }}
+    steps:
+      - name: Build combined FRD context
+        id: combine
+        uses: actions/github-script@v7
+        env:
+          FRD_INPUT: ${{ inputs.frd_query }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          script: |
+            const frdText = process.env.FRD_INPUT || '';
+            const issueNumber = (process.env.ISSUE_NUMBER || '').trim();
+
+            let combined = frdText;
+
+            if (issueNumber) {
+              core.info(`Fetching issue #${issueNumber} for additional context...`);
+              const issue = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(issueNumber)
+              });
+
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(issueNumber),
+                per_page: 20
+              });
+
+              let issueContext = [
+                '=== GITHUB ISSUE CONTEXT ===',
+                `Issue #${issue.data.number}: ${issue.data.title}`,
+                `State: ${issue.data.state}`,
+                `Labels: ${issue.data.labels.map(l => l.name).join(', ') || 'None'}`,
+                `Author: ${issue.data.user.login}`,
+                `Created: ${issue.data.created_at}`,
+                '',
+                'Issue Description:',
+                issue.data.body || '_No description provided._',
+              ].join('\n');
+
+              if (comments.data.length > 0) {
+                issueContext += '\n\nIssue Comments:';
+                for (const c of comments.data) {
+                  issueContext += `\n--- Comment by ${c.user.login} (${c.created_at}) ---\n${c.body}`;
+                }
+              }
+
+              issueContext += '\n=== END GITHUB ISSUE CONTEXT ===';
+              combined = issueContext + '\n\n' + frdText;
+              core.info('Combined FRD context built with issue details.');
+            } else {
+              core.info('No issue number provided — using FRD text only.');
+            }
+
+            core.setOutput('combined_frd', combined);
+
+  # ════════════════════════════════════════════════════════
+  # STEP 1 — Requirement Drift Analysis
+  # ════════════════════════════════════════════════════════
+  requirement-drift:
+    needs: [prepare-context]
+    uses: ./.github/workflows/council-query.yml
+    with:
+      query: |
+        REQUIREMENT DRIFT ANALYSIS
+
+        You are a senior product analyst. You have been given a Feature Requirement Document (FRD)
+        and access to the full codebase of the application. Your task is to perform a thorough
+        requirement drift analysis.
+
+        === FEATURE REQUIREMENT DOCUMENT ===
+        ${{ needs.prepare-context.outputs.combined_frd }}
+        === END FRD ===
+
+        Analyse the codebase against the FRD above and produce a structured report covering:
+
+        1. **Implemented Features** — List every FRD requirement that IS fully implemented.
+           For each, cite the exact files and functions that satisfy it.
+
+        2. **Partially Implemented Features** — Requirements where some acceptance criteria
+           are met but others are missing. Detail what is done and what is not.
+
+        3. **Missing / Not Implemented Features** — Requirements with zero implementation.
+           Suggest where in the codebase they should be added.
+
+        4. **Extra Features (not in FRD)** — Any functionality in the codebase that is NOT
+           described in the FRD. Note whether these are beneficial or unnecessary.
+
+        5. **Drift Summary Table** — A markdown table with columns:
+           | Requirement ID | Title | Status | Coverage % | Notes |
+
+        6. **Overall Completion Rate** — Percentage of FRD requirements fully satisfied.
+
+        Be precise, reference file paths and line numbers, and do not fabricate information.
+      artifact_name: gatekeeper-step1-requirement-drift
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════
+  # STEP 2 — Technical Excellence Analysis
+  # ════════════════════════════════════════════════════════
+  technical-excellence:
+    uses: ./.github/workflows/council-query.yml
+    with:
+      query: |
+        TECHNICAL EXCELLENCE ANALYSIS
+
+        You are a principal software architect. Perform a comprehensive technical review
+        of the entire codebase. Analyse the following areas and provide actionable findings:
+
+        1. **Architecture Assessment**
+           - Overall architecture pattern (monolith, microservices, layered, etc.)
+           - Separation of concerns — is business logic cleanly separated from I/O?
+           - Dependency management and coupling between modules
+
+        2. **Code Quality Issues**
+           - Code smells, anti-patterns, or duplicated logic
+           - Error handling gaps (missing try/except, unhelpful error messages)
+           - Input validation and sanitisation weaknesses
+           - Hard-coded values that should be configurable
+
+        3. **Security Concerns**
+           - Potential injection vectors (SQL, XSS, command injection)
+           - Secrets or credentials in source
+           - Missing authentication / authorisation checks
+           - CORS, CSRF, or header-related risks
+
+        4. **Performance & Scalability**
+           - Inefficient algorithms or data structures
+           - Missing caching opportunities
+           - Concurrency or thread-safety issues
+           - File I/O bottlenecks
+
+        5. **Maintainability & Best Practices**
+           - Adherence to language style guides (PEP 8 for Python, etc.)
+           - Documentation quality (docstrings, README completeness)
+           - Logging and observability gaps
+           - Dockerfile and CI/CD best practices
+
+        6. **Recommendations** — Prioritised list of improvements (High / Medium / Low).
+
+        Reference specific files, functions, and line numbers. Do not fabricate information.
+      artifact_name: gatekeeper-step2-technical-excellence
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════
+  # STEP 3 — Unit Test Coverage Analysis
+  # ════════════════════════════════════════════════════════
+  unit-test-coverage:
+    uses: ./.github/workflows/council-query.yml
+    with:
+      query: |
+        UNIT TEST COVERAGE ANALYSIS
+
+        You are a senior QA engineer. Analyse the codebase and its test suite to produce
+        a comprehensive test coverage report.
+
+        1. **Existing Test Inventory**
+           - List every test file found in the codebase
+           - For each test file, list the test functions/methods and what they cover
+           - Identify the testing framework used (pytest, unittest, etc.)
+
+        2. **Feature-to-Test Mapping**
+           - For each API endpoint or major feature, identify which tests exercise it
+           - Flag any endpoints or features with ZERO test coverage
+
+        3. **Current Coverage Estimate**
+           - Based on the test files and application code, estimate the approximate
+             line/branch coverage percentage
+           - Identify the files or modules with the LEAST coverage
+
+        4. **Coverage Gaps** — Specific untested scenarios:
+           - Untested API endpoints (list HTTP method + path)
+           - Untested error/edge cases (e.g., invalid input, missing fields, 404s)
+           - Untested business logic branches
+           - Missing integration or smoke tests
+
+        5. **Recommended Tests to Add** — For each gap, provide:
+           - Test function name suggestion
+           - Brief description of what it should assert
+           - Priority (High / Medium / Low)
+
+        6. **Target Coverage Recommendation**
+           - Current estimated coverage percentage
+           - Recommended target coverage percentage with justification
+           - Effort estimate to close the gap (number of new tests needed)
+
+        Reference specific files, functions, and line numbers. Do not fabricate information.
+      artifact_name: gatekeeper-step3-unit-test-coverage
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════
+  # STEP 4 — Production Readiness Verdict
+  #          Depends on Steps 1-3; consumes their chairman outputs
+  # ════════════════════════════════════════════════════════
+  production-readiness:
+    needs: [requirement-drift, technical-excellence, unit-test-coverage]
+    uses: ./.github/workflows/council-query.yml
+    with:
+      query: |
+        PRODUCTION READINESS ASSESSMENT
+
+        You are a Release Manager and the final decision-maker. Three independent analysis
+        reports have been produced for this application. Your job is to consume these reports
+        and render a clear GO / NO-GO verdict on whether the application is fit for production.
+
+        ═══════════════════════════════════════════════
+        REPORT 1 — REQUIREMENT DRIFT ANALYSIS (Chairman Summary)
+        ═══════════════════════════════════════════════
+        ${{ needs.requirement-drift.outputs.chairman_response }}
+
+        ═══════════════════════════════════════════════
+        REPORT 2 — TECHNICAL EXCELLENCE ANALYSIS (Chairman Summary)
+        ═══════════════════════════════════════════════
+        ${{ needs.technical-excellence.outputs.chairman_response }}
+
+        ═══════════════════════════════════════════════
+        REPORT 3 — UNIT TEST COVERAGE ANALYSIS (Chairman Summary)
+        ═══════════════════════════════════════════════
+        ${{ needs.unit-test-coverage.outputs.chairman_response }}
+
+        ═══════════════════════════════════════════════
+
+        Based on the above three reports, produce:
+
+        1. **Executive Summary** — 3-5 sentence overview of the application's readiness.
+
+        2. **Scoring Matrix** — Rate each dimension on a 1-10 scale:
+           | Dimension               | Score | Justification |
+           |-------------------------|-------|---------------|
+           | Requirement Completeness|       |               |
+           | Code Quality            |       |               |
+           | Security Posture        |       |               |
+           | Test Coverage           |       |               |
+           | Production Readiness    |       |               |
+
+        3. **Critical Blockers** — Issues that MUST be resolved before production.
+
+        4. **Recommended Improvements** — Issues that SHOULD be addressed but are not blockers.
+
+        5. **Final Verdict** — Clearly state one of:
+           - ✅ **GO** — Application is fit for production deployment.
+           - ⚠️ **CONDITIONAL GO** — Can deploy after addressing critical blockers.
+           - ❌ **NO-GO** — Application is NOT ready for production. List required actions.
+
+        Be decisive, evidence-based, and reference specific findings from the reports.
+      artifact_name: gatekeeper-step4-production-readiness
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════
+  # FINAL — Bundle all artifacts into a single download
+  # ════════════════════════════════════════════════════════
+  final-report:
+    needs: [prepare-context, requirement-drift, technical-excellence, unit-test-coverage, production-readiness]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download Step 1 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gatekeeper-step1-requirement-drift
+          path: /tmp/gatekeeper-report/step1-requirement-drift
+        continue-on-error: true
+
+      - name: Download Step 2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gatekeeper-step2-technical-excellence
+          path: /tmp/gatekeeper-report/step2-technical-excellence
+        continue-on-error: true
+
+      - name: Download Step 3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gatekeeper-step3-unit-test-coverage
+          path: /tmp/gatekeeper-report/step3-unit-test-coverage
+        continue-on-error: true
+
+      - name: Download Step 4 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gatekeeper-step4-production-readiness
+          path: /tmp/gatekeeper-report/step4-production-readiness
+        continue-on-error: true
+
+      - name: Build consolidated gatekeeper report
+        env:
+          FRD_INPUT: ${{ needs.prepare-context.outputs.combined_frd }}
+          CHAIRMAN_1: ${{ needs.requirement-drift.outputs.chairman_response }}
+          CHAIRMAN_2: ${{ needs.technical-excellence.outputs.chairman_response }}
+          CHAIRMAN_3: ${{ needs.unit-test-coverage.outputs.chairman_response }}
+          CHAIRMAN_4: ${{ needs.production-readiness.outputs.chairman_response }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, glob
+          from datetime import datetime, timezone
+
+          def read_file(path):
+              try:
+                  return open(path).read().strip()
+              except (FileNotFoundError, IsADirectoryError):
+                  return ""
+
+          def load_council_json(step_dir):
+              """Load the council-results.json from a step's artifact directory."""
+              json_path = os.path.join(step_dir, "council-results.json")
+              if os.path.exists(json_path):
+                  try:
+                      return json.loads(open(json_path).read())
+                  except json.JSONDecodeError:
+                      return None
+              return None
+
+          report_dir = "/tmp/gatekeeper-report"
+          steps = [
+              ("step1-requirement-drift",    "Requirement Drift Analysis"),
+              ("step2-technical-excellence",  "Technical Excellence Analysis"),
+              ("step3-unit-test-coverage",    "Unit Test Coverage Analysis"),
+              ("step4-production-readiness",  "Production Readiness Verdict"),
+          ]
+
+          # Build the consolidated JSON report
+          consolidated = {
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "frd_input": os.environ.get("FRD_INPUT", ""),
+              "steps": {},
+              "chairman_summaries": {},
+          }
+
+          chairman_envs = {
+              "step1-requirement-drift":    os.environ.get("CHAIRMAN_1", ""),
+              "step2-technical-excellence":  os.environ.get("CHAIRMAN_2", ""),
+              "step3-unit-test-coverage":    os.environ.get("CHAIRMAN_3", ""),
+              "step4-production-readiness":  os.environ.get("CHAIRMAN_4", ""),
+          }
+
+          for step_key, step_title in steps:
+              step_dir = os.path.join(report_dir, step_key)
+              council_data = load_council_json(step_dir)
+
+              consolidated["steps"][step_key] = {
+                  "title": step_title,
+                  "council_results": council_data,
+              }
+              consolidated["chairman_summaries"][step_key] = chairman_envs.get(step_key, "")
+
+          # Write consolidated JSON
+          with open(os.path.join(report_dir, "gatekeeper-consolidated.json"), "w") as f:
+              json.dump(consolidated, f, indent=2)
+
+          # Write a human-readable markdown summary
+          md_lines = [
+              "# 🛡️ Gatekeeper Analysis Report",
+              "",
+              f"> **Generated:** {consolidated['generated_at']}",
+              "",
+              "---",
+              "",
+          ]
+
+          for step_key, step_title in steps:
+              chairman_text = chairman_envs.get(step_key, "_Not available._")
+              md_lines.extend([
+                  f"## {step_title}",
+                  "",
+                  f"### Chairman Summary",
+                  "",
+                  chairman_text if chairman_text else "_Not available._",
+                  "",
+                  "---",
+                  "",
+              ])
+
+          with open(os.path.join(report_dir, "gatekeeper-report.md"), "w") as f:
+              f.write("\n".join(md_lines))
+
+          total_size = sum(
+              os.path.getsize(os.path.join(dp, fn))
+              for dp, dn, filenames in os.walk(report_dir)
+              for fn in filenames
+          )
+          print(f"Consolidated report created: {total_size} bytes across {report_dir}")
+          PYEOF
+
+      - name: Publish gatekeeper summary
+        if: always()
+        env:
+          FRD_INPUT: ${{ needs.prepare-context.outputs.combined_frd }}
+          CHAIRMAN_1: ${{ needs.requirement-drift.outputs.chairman_response }}
+          CHAIRMAN_2: ${{ needs.technical-excellence.outputs.chairman_response }}
+          CHAIRMAN_3: ${{ needs.unit-test-coverage.outputs.chairman_response }}
+          CHAIRMAN_4: ${{ needs.production-readiness.outputs.chairman_response }}
+        run: |
+          {
+            echo "# 🛡️ Gatekeeper Analysis — Final Report"
+            echo ""
+            printf '> **FRD Input:** %.200s...\n' "$FRD_INPUT"
+            echo ""
+
+            echo "---"
+            echo ""
+            echo "## 🎯 Step 4 — Production Readiness Verdict"
+            echo ""
+            if [ -n "$CHAIRMAN_4" ]; then
+              echo "$CHAIRMAN_4"
+            else
+              echo "_Production readiness verdict unavailable._"
+            fi
+            echo ""
+
+            echo "---"
+            echo ""
+            echo "<details>"
+            echo "<summary>📋 Step 1 — Requirement Drift Analysis (Chairman Summary)</summary>"
+            echo ""
+            if [ -n "$CHAIRMAN_1" ]; then
+              echo "$CHAIRMAN_1"
+            else
+              echo "_Not available._"
+            fi
+            echo ""
+            echo "</details>"
+            echo ""
+
+            echo "<details>"
+            echo "<summary>🏗️ Step 2 — Technical Excellence Analysis (Chairman Summary)</summary>"
+            echo ""
+            if [ -n "$CHAIRMAN_2" ]; then
+              echo "$CHAIRMAN_2"
+            else
+              echo "_Not available._"
+            fi
+            echo ""
+            echo "</details>"
+            echo ""
+
+            echo "<details>"
+            echo "<summary>🧪 Step 3 — Unit Test Coverage Analysis (Chairman Summary)</summary>"
+            echo ""
+            if [ -n "$CHAIRMAN_3" ]; then
+              echo "$CHAIRMAN_3"
+            else
+              echo "_Not available._"
+            fi
+            echo ""
+            echo "</details>"
+          } >> $GITHUB_STEP_SUMMARY
+
+          echo "✅ Gatekeeper analysis complete — see Step Summary and artifacts."
+
+      - name: Upload consolidated gatekeeper report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatekeeper-final-analysis
+          path: /tmp/gatekeeper-report/
+          retention-days: 90

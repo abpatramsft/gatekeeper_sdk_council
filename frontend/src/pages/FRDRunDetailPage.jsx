@@ -64,6 +64,8 @@ export default function FRDRunDetailPage({ connection }) {
   )
   if (!data) return null
 
+  const hasCastImpact = !!data.cast_impact_analysis
+
   return (
     <div className="detail-page">
       <Link to="/frd/runs" className="back-link">← Back to FRD runs</Link>
@@ -77,8 +79,57 @@ export default function FRDRunDetailPage({ connection }) {
         <QueryBox query={data.query} />
       )}
 
-      {/* Council results — flat structure */}
-      <FRDCouncilPanel data={data} />
+      {/* Top-level tabs: Council Analysis | Cast Impact Analysis */}
+      <FRDTabs data={data} hasCastImpact={hasCastImpact} />
+    </div>
+  )
+}
+
+
+/* ── Top-level tabs ─────────────────────────────────────────── */
+
+function FRDTabs({ data, hasCastImpact }) {
+  const [activeTab, setActiveTab] = useState('council')
+
+  return (
+    <>
+      {hasCastImpact && (
+        <div className="step-tabs">
+          <button
+            className={`step-tab ${activeTab === 'council' ? 'active' : ''}`}
+            onClick={() => setActiveTab('council')}
+          >
+            📝 Council Analysis
+          </button>
+          <button
+            className={`step-tab ${activeTab === 'cast' ? 'active' : ''}`}
+            onClick={() => setActiveTab('cast')}
+          >
+            🏗️ Cast Impact Analysis
+          </button>
+        </div>
+      )}
+
+      {activeTab === 'council' ? (
+        <FRDCouncilPanel data={data} />
+      ) : (
+        <CastImpactPanel markdown={data.cast_impact_analysis} />
+      )}
+    </>
+  )
+}
+
+
+/* ── Cast Impact Analysis Panel ─────────────────────────────── */
+
+function CastImpactPanel({ markdown }) {
+  if (!markdown) return <p style={{ color: 'var(--text-muted)' }}>No Cast Impact Analysis available.</p>
+
+  return (
+    <div className="step-panel" style={{ padding: 24 }}>
+      <div className="md-content">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
+      </div>
     </div>
   )
 }

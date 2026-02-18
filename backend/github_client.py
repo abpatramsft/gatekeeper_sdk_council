@@ -157,11 +157,30 @@ class GitHubClient:
             # search flat & nested
             for name in zf.namelist():
                 if name.endswith(candidate):
-                    return json.loads(zf.read(name))
+                    result = json.loads(zf.read(name))
+                    # Also look for cast-impact-analysis markdown and merge it in
+                    result = self._merge_cast_impact(zf, result)
+                    return result
 
         # fallback: any .json
         for name in zf.namelist():
             if name.endswith(".json"):
-                return json.loads(zf.read(name))
+                result = json.loads(zf.read(name))
+                result = self._merge_cast_impact(zf, result)
+                return result
 
         return {"error": "No JSON found in artifact"}
+
+    @staticmethod
+    def _merge_cast_impact(zf: zipfile.ZipFile, result: dict) -> dict:
+        """If the zip contains a cast-impact-analysis file, merge its markdown content into the result dict."""
+        for name in zf.namelist():
+            basename = name.rsplit("/", 1)[-1] if "/" in name else name
+            if basename.startswith("cast-impact-analysis"):
+                try:
+                    content = zf.read(name).decode("utf-8", errors="replace")
+                    result["cast_impact_analysis"] = content
+                except Exception:
+                    pass
+                break
+        return result

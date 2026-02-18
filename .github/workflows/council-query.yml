@@ -1,0 +1,92 @@
+name: Council Query
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Your question about the codebase'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      query:
+        description: 'Your question about the codebase'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Name for the uploaded artifact'
+        required: false
+        type: string
+        default: 'council-results'
+    outputs:
+      chairman_response:
+        description: 'The chairman final synthesis response'
+        value: ${{ jobs.council.outputs.chairman_response }}
+
+jobs:
+  council:
+    runs-on: ubuntu-latest
+    outputs:
+      chairman_response: ${{ steps.capture_chairman.outputs.response }}
+    permissions:
+      contents: read
+
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Copilot CLI is still needed as the SDK backend ──
+      - name: Install Copilot CLI
+        run: |
+          curl -fsSL https://gh.io/copilot-install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Copilot CLI
+        run: copilot --version
+
+      # ── Python + SDK setup ──
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install github-copilot-sdk python-dotenv
+          # Ensure the SDK's bundled copilot binary is executable
+          chmod +x "$(python -c 'import copilot, pathlib; print(pathlib.Path(copilot.__file__).parent / "bin" / "copilot")')" || true
+
+      # ── Run the full 3-stage council via SDK ──
+      - name: Run Council via Copilot SDK
+        env:
+          QUERY_TEXT: ${{ inputs.query }}
+          OUTPUT_DIR: /tmp/council-results
+        run: |
+          cd scripts && python council_ci_runner.py
+
+      # ── Capture chairman output for workflow_call consumers ──
+      - name: Capture chairman output
+        id: capture_chairman
+        if: always()
+        run: |
+          RESPONSE=$(cat /tmp/council-results/chairman_response.txt 2>/dev/null || echo "Chairman synthesis unavailable.")
+          # GitHub Actions outputs support up to 1MB; truncate to be safe
+          TRUNCATED="${RESPONSE:0:900000}"
+          {
+            echo "response<<CHAIRMAN_EOF_DELIMITER"
+            echo "$TRUNCATED"
+            echo "CHAIRMAN_EOF_DELIMITER"
+          } >> "$GITHUB_OUTPUT"
+          echo "Chairman output captured (${#TRUNCATED} chars)"
+
+      # ── Upload results artifact ──
+      - name: Upload council results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name || 'council-results' }}
+          path: /tmp/council-results/
+          retention-days: 90
