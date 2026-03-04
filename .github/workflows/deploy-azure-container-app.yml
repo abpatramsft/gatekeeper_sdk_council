@@ -1,0 +1,147 @@
+name: Deploy to Azure Container Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: staging
+      image_tag:
+        description: "Docker image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+# ──────────────────────────────────────────────────────────
+# Required GitHub Secrets / Variables:
+#
+#   AZURE_CREDENTIALS          – Service principal JSON for azure/login
+#                                 { clientId, clientSecret, subscriptionId, tenantId }
+#   AZURE_SUBSCRIPTION_ID      – Azure subscription ID
+#   AZURE_RESOURCE_GROUP       – Resource group containing the Container App
+#   AZURE_CONTAINER_APP_NAME   – Name of the Azure Container App
+#   AZURE_CONTAINER_REGISTRY   – ACR login server (e.g. myregistry.azurecr.io)
+#   ACR_USERNAME               – ACR admin or SP username
+#   ACR_PASSWORD               – ACR admin or SP password
+#
+# Optional secrets (passed as env vars to the Container App):
+#   GITHUB_TOKEN_APP           – PAT or App token for Copilot / GitHub API
+#   AZURE_AI_PROJECT_CONN_STR  – Azure AI project connection string
+#   AZURE_OPENAI_ENDPOINT      – Azure OpenAI endpoint
+# ──────────────────────────────────────────────────────────
+
+env:
+  IMAGE_NAME: gatekeeper-viewer
+  CONTAINER_APP_NAME: ${{ vars.AZURE_CONTAINER_APP_NAME || 'gatekeeper-viewer' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ════════════════════════════════════════════════════════
+  # BUILD — Build & push Docker image to ACR
+  # ════════════════════════════════════════════════════════
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      full_image: ${{ steps.meta.outputs.full_image }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: meta
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_SHA::8}"
+          fi
+          FULL="${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "🏷️  Image: ${FULL}"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build and push image with ACR Build
+        run: |
+          az acr build \
+            --registry "${{ secrets.AZURE_CONTAINER_REGISTRY }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}" \
+            --file Dockerfile \
+            .
+
+  # ════════════════════════════════════════════════════════
+  # DEPLOY — Update the Azure Container App revision
+  # ════════════════════════════════════════════════════════
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP_NAME }}
+          imageToDeploy: ${{ needs.build.outputs.full_image }}
+          registryUrl: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+          registryUsername: ${{ secrets.ACR_USERNAME }}
+          registryPassword: ${{ secrets.ACR_PASSWORD }}
+          targetPort: 8000
+          ingress: external
+          environmentVariables: >-
+            GITHUB_TOKEN=secretref:github-token
+            AZURE_AI_PROJECT_CONNECTION_STRING=secretref:azure-ai-conn-str
+            AZURE_OPENAI_ENDPOINT=secretref:azure-openai-endpoint
+
+      - name: Verify deployment
+        run: |
+          echo "⏳ Waiting for revision to become active..."
+          sleep 15
+
+          FQDN=$(az containerapp show \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+
+          echo "🌐 Application URL: https://${FQDN}"
+
+          # Quick health check
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${FQDN}" || true)
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+            echo "✅ Deployment healthy (HTTP ${STATUS})"
+          else
+            echo "⚠️  Deployment returned HTTP ${STATUS} — check container logs"
+            az containerapp logs show \
+              --name "${{ env.CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --tail 30
+            exit 1
+          fi
+
+      - name: Print deployment summary
+        if: always()
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  Deployment Summary"
+          echo "══════════════════════════════════════════"
+          echo "  Environment : ${{ inputs.environment }}"
+          echo "  Image       : ${{ needs.build.outputs.full_image }}"
+          echo "  Container   : ${{ env.CONTAINER_APP_NAME }}"
+          echo "  Resource Grp: ${{ secrets.AZURE_RESOURCE_GROUP }}"
+          echo "══════════════════════════════════════════"
